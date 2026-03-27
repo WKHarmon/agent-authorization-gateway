@@ -1,8 +1,8 @@
 {
   "port": 18795,
   "gmail_account": "user@example.com",
-  "vault_path": "secret/gmail-proxy",
-  "vault_api_key_path": "secret/your-project/gmail-proxy",
+  "vault_path": "secret/authorization-gateway",
+  "vault_api_key_path": "secret/openclaw/authorization-gateway",
   "agent_name": "YourAgent",
   "approver_name": "Approver",
   "signal": {
@@ -13,9 +13,9 @@
   },
   "approval_url_base": "https://approval.your-domain.com",
   "callback": {
-    "url": "https://your-openclaw-domain.com/hooks/gmail-grant",
+    "url": "https://your-openclaw-domain.com/hooks/grant-callback",
     "cf_auth": true,
-    "hooks_token_vault_path": "secret/your-project/gateway"
+    "hooks_token_vault_path": "secret/openclaw/gateway"
   },
   "rate_limit": {
     "grant_requests_per_minute": 5
@@ -25,5 +25,47 @@
     "level2_default_duration_minutes": 30,
     "level3_default_duration_minutes": 15
   },
-  "sensitive_patterns_file": "sensitive_patterns.json"
+  "sensitive_patterns_file": "sensitive_patterns.json",
+  "providers": {
+    "ssh": {
+      "enabled": false,
+      "vault_ssh_mount": "ssh-client-signer",
+      "vault_ssh_role": "openclaw",
+      "default_ttl_minutes": 30,
+      "max_ttl_minutes": 30,
+      "hosts": {
+        "server": {
+          "hostnames": ["server", "server.local", "server.wkharmon.com", "server.tailc05c6.ts.net"],
+          "principals": ["pi", "user", "kyle", "admin", "root", "openclaw"],
+          "description": "Primary server"
+        },
+        "aiserver": {
+          "hostnames": ["aiserver", "aiserver.local", "aiserver.wkharmon.com", "aiserver.tailc05c6.ts.net"],
+          "principals": ["pi", "user", "kyle", "admin", "root", "openclaw"],
+          "description": "AI server"
+        },
+        "wkh-gaming": {
+          "hostnames": ["wkh-gaming", "wkh-gaming.local", "wkh-gaming.wkharmon.com", "wkh-gaming.tailc05c6.ts.net"],
+          "principals": ["pi", "user", "kyle", "admin", "root", "openclaw"],
+          "description": "Gaming PC"
+        },
+        "openclaw": {
+          "hostnames": ["openclaw", "openclaw.local", "openclaw.wkharmon.com", "openclaw.tailc05c6.ts.net"],
+          "principals": ["pi", "user", "kyle", "admin", "root", "openclaw"],
+          "description": "OpenClaw server"
+        },
+        "vault": {
+          "hostnames": ["vault", "vault.local", "vault.wkharmon.com", "vault.tailc05c6.ts.net", "secrets", "secrets.local", "secrets.wkharmon.com", "secrets.tailc05c6.ts.net"],
+          "principals": ["pi", "user", "kyle", "admin", "root", "openclaw"],
+          "description": "Vault / secrets server"
+        }
+      },
+      "host_groups": {},
+      "defaults": {
+        "level1_ttl_minutes": 30,
+        "level2_ttl_minutes": 30,
+        "level3_ttl_minutes": 30
+      }
+    }
+  }
 }

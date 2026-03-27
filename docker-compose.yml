@@ -1,7 +1,7 @@
 services:
-  email-proxy:
+  authorization-gateway:
     build: .
-    container_name: email-proxy
+    container_name: authorization-gateway
     volumes:
       - ./data:/app/data
       - ./config.json:/app/config.json:ro
@@ -23,7 +23,7 @@ services:
     environment:
       - MODE=json-rpc
       # Port must match config.json "port". Append ?token=<secret> to authenticate.
-      - RECEIVE_WEBHOOK_URL=http://email-proxy:${PROXY_PORT:-18795}/internal/signal-webhook
+      - RECEIVE_WEBHOOK_URL=http://authorization-gateway:${PROXY_PORT:-18795}/internal/signal-webhook?token=${SIGNAL_WEBHOOK_TOKEN:-}
     restart: unless-stopped
 
 networks:

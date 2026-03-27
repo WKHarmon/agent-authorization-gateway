@@ -19,6 +19,7 @@ ENV REQUESTS_CA_BUNDLE=/app/certs/ca-bundle.pem
 ENV SSL_CERT_FILE=/app/certs/ca-bundle.pem
 
 COPY sensitive_patterns.json server.py ./
+COPY gateway/ /app/gateway/
 
 RUN mkdir -p data
 
