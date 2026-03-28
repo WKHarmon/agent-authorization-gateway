@@ -228,7 +228,7 @@ Get a single email. Always returns metadata. Returns `body` and `attachments` on
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| `override_sensitive` | bool | false | Level 3 only — override sensitive pattern redaction |
+| `override_sensitive` | bool | false | Override sensitive pattern redaction |
 
 Response (no grant):
 ```json
@@ -334,7 +334,7 @@ Response:
 
 Downloads the attachment binary. Returns the raw file with correct `Content-Type` and `Content-Disposition` headers.
 
-Requires a grant covering the parent message. Sensitive patterns on the parent message are checked — blocked unless Level 3 with `?override_sensitive=true`.
+Requires a grant covering the parent message. Sensitive patterns on the parent message are checked — blocked unless `?override_sensitive=true` is passed.
 
 Works with consumed Level 1 grants within the expiry window (so you can read the body and then download attachments in the same session).
 
@@ -344,7 +344,7 @@ Returns all messages in a thread. Metadata is always returned for every message.
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| `override_sensitive` | bool | false | Level 3 only |
+| `override_sensitive` | bool | false | Override sensitive pattern redaction |
 
 Response:
 ```json
@@ -392,7 +392,7 @@ Returns 404 if `startHistoryId` is too old or invalid.
 
 ### Sensitive Email Filtering
 
-Emails matching patterns in `sensitive_patterns.json` have their bodies replaced with a redaction notice, even with an active grant. Level 3 grants can override with `?override_sensitive=true`. Attachment downloads are also blocked for sensitive messages.
+Emails matching patterns in `sensitive_patterns.json` have their bodies replaced with a redaction notice, even with an active grant. Any grant level can override with `?override_sensitive=true`. Attachment downloads are also blocked for sensitive messages unless overridden.
 
 ### Level 1 Grant Lifecycle
 

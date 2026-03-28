@@ -77,7 +77,7 @@ Single email. Always returns metadata. Returns `body: null` without a grant. Wit
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| `override_sensitive` | bool | false | Level 3 only -- override sensitive pattern redaction |
+| `override_sensitive` | bool | false | Override sensitive pattern redaction |
 
 ### `GET /api/labels`
 All Gmail labels with message/thread counts.
@@ -97,7 +97,7 @@ Attachment metadata (filename, mimeType, size) -- no grant needed for the list.
 Returns full email body. Level 1 grants are **consumed** after the first body read (but stay valid for attachment downloads until expiry).
 
 ### `GET /api/emails/:messageId/attachments/:attachmentId`
-Download attachment binary. Requires a grant covering the parent message. Sensitive patterns on the parent message are checked -- blocked unless Level 3 with `?override_sensitive=true`.
+Download attachment binary. Requires a grant covering the parent message. Sensitive patterns on the parent message are checked -- blocked unless `?override_sensitive=true` is passed.
 
 Works with consumed Level 1 grants within the expiry window (so you can read the body and then download attachments in the same session).
 
@@ -106,7 +106,7 @@ All messages in a thread. Bodies included only for messages covered by a grant. 
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| `override_sensitive` | bool | false | Level 3 only -- override sensitive pattern redaction |
+| `override_sensitive` | bool | false | Override sensitive pattern redaction |
 
 ### `GET /api/history`
 Incremental changes since a historyId. Requires Level 2 or 3 grant.
@@ -120,7 +120,7 @@ Incremental changes since a historyId. Requires Level 2 or 3 grant.
 
 ## Sensitive Email Filtering
 
-Emails matching patterns in the gateway's `sensitive_patterns.json` (password resets, 2FA codes, security alerts) have bodies replaced with a redaction notice, even with an active grant. Level 3 grants can override with `?override_sensitive=true`. Attachment downloads are also blocked for sensitive messages unless overridden.
+Emails matching patterns in the gateway's `sensitive_patterns.json` (password resets, 2FA codes, security alerts) have bodies replaced with a redaction notice, even with an active grant. Any grant level can override with `?override_sensitive=true`. Attachment downloads are also blocked for sensitive messages unless overridden.
 
 ## Level 1 Gmail Grant Lifecycle
 

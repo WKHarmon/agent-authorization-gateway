@@ -484,7 +484,7 @@ def _register_gmail_routes(app: FastAPI):
         sensitive_match = is_sensitive(
             metadata.get("subject", ""), metadata.get("from", "")
         )
-        if sensitive_match and not (grant["level"] == 3 and override_sensitive):
+        if sensitive_match and not override_sensitive:
             audit({
                 "action": "message_redacted",
                 "messageId": message_id,
@@ -571,7 +571,7 @@ def _register_gmail_routes(app: FastAPI):
         sensitive_match = is_sensitive(
             metadata.get("subject", ""), metadata.get("from", "")
         )
-        if sensitive_match and not (grant["level"] == 3 and override_sensitive):
+        if sensitive_match and not override_sensitive:
             raise HTTPException(
                 403,
                 f"Attachment blocked — parent message matches sensitive pattern: {sensitive_match}",
@@ -685,7 +685,7 @@ def _register_gmail_routes(app: FastAPI):
             sensitive_match = is_sensitive(
                 metadata.get("subject", ""), metadata.get("from", "")
             )
-            if sensitive_match and not (grant["level"] == 3 and override_sensitive):
+            if sensitive_match and not override_sensitive:
                 messages_out.append({
                     "metadata": metadata,
                     "access": f"level{grant['level']}",
