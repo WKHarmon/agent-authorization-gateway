@@ -219,14 +219,9 @@ def _register_ssh_routes(app: FastAPI):
             "serial": result.get("serial_number", ""),
         })
 
-        # Level 1 is single-use — consume the grant after issuing one cert
-        if grant["level"] == 1:
-            conn = db_conn()
-            try:
-                conn.execute("UPDATE grants SET status='consumed' WHERE id=?", (grant["id"],))
-                conn.commit()
-            finally:
-                conn.close()
+        # SSH grants are NOT consumed after a single use because certificates
+        # are short-lived and must be renewed within the grant window.
+        # The grant naturally expires via expires_at.
 
         return {
             "signedKey": result["signed_key"],
