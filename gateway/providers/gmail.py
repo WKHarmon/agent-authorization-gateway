@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import binascii
 import json
 import logging
 from datetime import datetime, timezone
@@ -10,7 +11,7 @@ from fnmatch import fnmatch
 from html import escape
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 
 from gateway.audit import audit
 from gateway.config import CONFIG, SENSITIVE
@@ -156,9 +157,11 @@ def is_sensitive(subject: str, sender: str) -> Optional[str]:
 
 
 def get_active_grant_for_message(
-    message_id: str, include_consumed: bool = False,
+    message_id: str,
+    requestor_name: str,
+    include_consumed: bool = False,
 ) -> Optional[dict]:
-    """Find an active, unexpired grant that covers this message."""
+    """Find this requestor's active, unexpired grant covering a message."""
     now = datetime.now(timezone.utc).isoformat()
     conn = db_conn()
     try:
@@ -166,14 +169,16 @@ def get_active_grant_for_message(
         if include_consumed:
             row = conn.execute(
                 "SELECT * FROM grants WHERE status IN ('active','consumed') AND level=1 "
-                "AND resource_type='gmail' AND message_id=? AND expires_at>?",
-                (message_id, now),
+                "AND resource_type='gmail' AND message_id=? AND requestor=? "
+                "AND expires_at>?",
+                (message_id, requestor_name, now),
             ).fetchone()
         else:
             row = conn.execute(
                 "SELECT * FROM grants WHERE status='active' AND level=1 "
-                "AND resource_type='gmail' AND message_id=? AND expires_at>?",
-                (message_id, now),
+                "AND resource_type='gmail' AND message_id=? AND requestor=? "
+                "AND expires_at>?",
+                (message_id, requestor_name, now),
             ).fetchone()
         if row:
             return dict(row)
@@ -181,8 +186,8 @@ def get_active_grant_for_message(
         # Level 2 — query-based (verify message matches)
         rows = conn.execute(
             "SELECT * FROM grants WHERE status='active' AND level=2 "
-            "AND resource_type='gmail' AND expires_at>?",
-            (now,),
+            "AND resource_type='gmail' AND requestor=? AND expires_at>?",
+            (requestor_name, now),
         ).fetchall()
         for row in rows:
             grant = dict(row)
@@ -192,8 +197,8 @@ def get_active_grant_for_message(
         # Level 3 — full access
         row = conn.execute(
             "SELECT * FROM grants WHERE status='active' AND level=3 "
-            "AND resource_type='gmail' AND expires_at>?",
-            (now,),
+            "AND resource_type='gmail' AND requestor=? AND expires_at>?",
+            (requestor_name, now),
         ).fetchone()
         if row:
             return dict(row)
@@ -318,6 +323,12 @@ class GmailProvider:
 
 
 def _register_gmail_routes(app: FastAPI):
+
+    def _requestor_name(request: Request) -> str:
+        """Return the authenticated requestor attached by API-key middleware."""
+        return getattr(request.state, "requestor_name", None) or CONFIG.get(
+            "agent_name", "Agent"
+        )
 
     @app.get("/api/profile")
     async def get_profile():
@@ -450,7 +461,11 @@ def _register_gmail_routes(app: FastAPI):
         }
 
     @app.get("/api/emails/{message_id}")
-    async def get_email(message_id: str, override_sensitive: bool = False):
+    async def get_email(
+        message_id: str,
+        request: Request,
+        override_sensitive: bool = False,
+    ):
         """Get email by ID. Metadata always; full body only with an active grant."""
         service = await asyncio.to_thread(get_gmail_service)
         msg = await asyncio.to_thread(
@@ -461,7 +476,10 @@ def _register_gmail_routes(app: FastAPI):
         metadata = extract_metadata(msg)
         attachments = extract_attachment_metadata(msg.get("payload", {}))
 
-        grant = await asyncio.to_thread(get_active_grant_for_message, message_id)
+        requestor_name = _requestor_name(request)
+        grant = await asyncio.to_thread(
+            get_active_grant_for_message, message_id, requestor_name
+        )
 
         if not grant:
             audit({
@@ -469,6 +487,7 @@ def _register_gmail_routes(app: FastAPI):
                 "messageId": message_id,
                 "subject": metadata.get("subject", ""),
                 "grant": "level0",
+                "requestor": requestor_name,
             })
             return {
                 "metadata": metadata,
@@ -490,6 +509,7 @@ def _register_gmail_routes(app: FastAPI):
                 "messageId": message_id,
                 "grant": grant["id"],
                 "pattern": sensitive_match,
+                "requestor": requestor_name,
             })
             return {
                 "metadata": metadata,
@@ -504,7 +524,10 @@ def _register_gmail_routes(app: FastAPI):
         if grant["level"] == 1:
             conn = db_conn()
             try:
-                conn.execute("UPDATE grants SET status='consumed' WHERE id=?", (grant["id"],))
+                conn.execute(
+                    "UPDATE grants SET status='consumed' WHERE id=? AND requestor=?",
+                    (grant["id"], requestor_name),
+                )
                 conn.commit()
             finally:
                 conn.close()
@@ -515,6 +538,7 @@ def _register_gmail_routes(app: FastAPI):
             "subject": metadata.get("subject", ""),
             "grant": grant["id"],
             "level": grant["level"],
+            "requestor": requestor_name,
         })
 
         return {
@@ -524,6 +548,103 @@ def _register_gmail_routes(app: FastAPI):
             "grant": grant["id"],
             "body": body,
         }
+
+    @app.get("/api/emails/{message_id}/raw")
+    async def download_raw_message(
+        message_id: str,
+        request: Request,
+        override_sensitive: bool = False,
+    ):
+        """Download the complete RFC message. Requires a covering grant."""
+        requestor_name = _requestor_name(request)
+        grant = await asyncio.to_thread(
+            get_active_grant_for_message,
+            message_id,
+            requestor_name,
+            True,
+        )
+        if not grant:
+            raise HTTPException(
+                403,
+                "No active grant covers this message. POST /api/grants/request first.",
+            )
+
+        service = await asyncio.to_thread(get_gmail_service)
+        metadata_msg = await asyncio.to_thread(
+            lambda: service.users().messages().get(
+                userId="me",
+                id=message_id,
+                format="metadata",
+                metadataHeaders=["From", "Subject"],
+            ).execute()
+        )
+        metadata = extract_metadata(metadata_msg)
+        sensitive_match = is_sensitive(
+            metadata.get("subject", ""), metadata.get("from", "")
+        )
+        if sensitive_match and not override_sensitive:
+            audit({
+                "action": "raw_message_blocked",
+                "messageId": message_id,
+                "grant": grant["id"],
+                "pattern": sensitive_match,
+                "requestor": requestor_name,
+            })
+            raise HTTPException(
+                403,
+                f"Raw message blocked — matches sensitive pattern: {sensitive_match}",
+            )
+
+        raw_msg = await asyncio.to_thread(
+            lambda: service.users().messages().get(
+                userId="me", id=message_id, format="raw"
+            ).execute()
+        )
+        encoded = raw_msg.get("raw")
+        if not isinstance(encoded, str) or not encoded:
+            raise HTTPException(502, "Gmail returned no raw message content")
+        encoded += "=" * (-len(encoded) % 4)
+        try:
+            eml = base64.b64decode(encoded, altchars=b"-_", validate=True)
+        except (ValueError, binascii.Error):
+            raise HTTPException(502, "Gmail returned invalid raw message content")
+
+        if grant["level"] == 1 and grant["status"] == "active":
+            conn = db_conn()
+            try:
+                conn.execute(
+                    "UPDATE grants SET status='consumed' "
+                    "WHERE id=? AND status='active' AND requestor=?",
+                    (grant["id"], requestor_name),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+        audit({
+            "action": "raw_message_download",
+            "messageId": message_id,
+            "subject": metadata.get("subject", ""),
+            "size": len(eml),
+            "grant": grant["id"],
+            "level": grant["level"],
+            "requestor": requestor_name,
+        })
+        safe_message_id = "".join(
+            char if char.isascii() and (char.isalnum() or char in "-_") else "_"
+            for char in message_id
+        )
+        return Response(
+            content=eml,
+            media_type="message/rfc822",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="gmail-{safe_message_id}.eml"'
+                ),
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     @app.get("/api/emails/{message_id}/attachments")
     async def list_attachments(message_id: str):
@@ -546,13 +667,13 @@ def _register_gmail_routes(app: FastAPI):
     async def download_attachment(
         message_id: str,
         attachment_id: str,
+        request: Request,
         override_sensitive: bool = False,
     ):
         """Download an attachment. Requires a grant covering the parent message."""
-        from fastapi.responses import Response
-
+        requestor_name = _requestor_name(request)
         grant = await asyncio.to_thread(
-            get_active_grant_for_message, message_id, True
+            get_active_grant_for_message, message_id, requestor_name, True
         )
         if not grant:
             raise HTTPException(
@@ -606,6 +727,7 @@ def _register_gmail_routes(app: FastAPI):
             "size": len(data),
             "grant": grant["id"],
             "level": grant["level"],
+            "requestor": requestor_name,
         })
 
         safe_filename = filename.replace('"', '_').replace('\r', '').replace('\n', '').replace('\x00', '')
@@ -658,7 +780,11 @@ def _register_gmail_routes(app: FastAPI):
         }
 
     @app.get("/api/threads/{thread_id}")
-    async def get_thread(thread_id: str, override_sensitive: bool = False):
+    async def get_thread(
+        thread_id: str,
+        request: Request,
+        override_sensitive: bool = False,
+    ):
         """Get all messages in a thread."""
         service = await asyncio.to_thread(get_gmail_service)
         thread = await asyncio.to_thread(
@@ -668,10 +794,14 @@ def _register_gmail_routes(app: FastAPI):
         )
 
         messages_out = []
+        requestor_name = _requestor_name(request)
         for msg in thread.get("messages", []):
             metadata = extract_metadata(msg)
             grant = await asyncio.to_thread(
-                get_active_grant_for_message, msg["id"], True
+                get_active_grant_for_message,
+                msg["id"],
+                requestor_name,
+                True,
             )
 
             if not grant:
@@ -711,6 +841,7 @@ def _register_gmail_routes(app: FastAPI):
             "threadId": thread_id,
             "messageCount": len(messages_out),
             "bodiesReturned": bodies_returned,
+            "requestor": requestor_name,
         })
 
         return {
@@ -720,6 +851,7 @@ def _register_gmail_routes(app: FastAPI):
 
     @app.get("/api/history")
     async def get_history(
+        request: Request,
         startHistoryId: str = Query(..., description="History ID to start from"),
         historyTypes: Optional[str] = Query(
             default=None,
@@ -731,12 +863,13 @@ def _register_gmail_routes(app: FastAPI):
     ):
         """Incremental history since a given historyId. Requires Level 2+ grant."""
         now = datetime.now(timezone.utc).isoformat()
+        requestor_name = _requestor_name(request)
         conn = db_conn()
         try:
             grant = conn.execute(
                 "SELECT * FROM grants WHERE status='active' AND level>=2 "
-                "AND resource_type='gmail' AND expires_at>?",
-                (now,),
+                "AND resource_type='gmail' AND requestor=? AND expires_at>?",
+                (requestor_name, now),
             ).fetchone()
         finally:
             conn.close()
@@ -780,6 +913,7 @@ def _register_gmail_routes(app: FastAPI):
             "grant": grant["id"],
             "level": grant["level"],
             "records": len(result.get("history", [])),
+            "requestor": requestor_name,
         })
 
         return {
