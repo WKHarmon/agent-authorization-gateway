@@ -27,7 +27,7 @@ curl -s "https://approval.your-domain.com/api/..." \
 | Level | Access | Approval | Default Duration |
 |-------|--------|----------|-----------------|
 | 0 | Metadata, labels, profile, attachment list, thread list | None | Always on |
-| 1 | Single message body + attachments | The approver approves via Signal | 5 min (single read, then consumed) |
+| 1 | Single message body, attachments, and original `.eml` export | The approver approves via Signal | 5 min (single read/export, then consumed) |
 | 2 | Messages matching a query, threads, history | The approver approves via Signal | 30 min |
 | 3 | Full gmail.readonly | The approver approves via Signal | 15 min |
 
@@ -96,6 +96,19 @@ Attachment metadata (filename, mimeType, size) -- no grant needed for the list.
 ### `GET /api/emails/:id` (with active grant)
 Returns full email body. Level 1 grants are **consumed** after the first body read (but stay valid for attachment downloads until expiry).
 
+### `GET /api/emails/:id/raw`
+Download the complete original message as a `.eml` file with all delivery
+headers and MIME structure preserved. Requires a covering grant and returns
+`Content-Type: message/rfc822`. Sensitive messages are blocked unless
+`?override_sensitive=true` is passed.
+
+Works with consumed Level 1 grants within the expiry window. If raw export is
+the first disclosure, it consumes the active Level 1 grant.
+
+```bash
+curl -fS "$BASE/api/emails/$MESSAGE_ID/raw" ... --output original-message.eml
+```
+
 ### `GET /api/emails/:messageId/attachments/:attachmentId`
 Download attachment binary. Requires a grant covering the parent message. Sensitive patterns on the parent message are checked -- blocked unless `?override_sensitive=true` is passed.
 
@@ -128,8 +141,8 @@ Level 1 grants have a special "single read" semantic:
 
 1. Grant is created with `status: pending`
 2. Approver approves -> `status: active`, timer starts
-3. First `GET /api/emails/:id` that returns a body -> `status: consumed`
-4. After consumption, the grant is still valid for **attachment downloads** until it expires
+3. First body read or original-message export -> `status: consumed`
+4. After consumption, the grant is still valid for **attachment downloads and original-message export** until it expires
 5. `GET /api/threads/:id` does **not** consume Level 1 grants
 6. Grant expires when the timer runs out -> `status: expired`
 

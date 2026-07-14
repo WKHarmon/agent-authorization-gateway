@@ -317,31 +317,44 @@ def register(app: FastAPI, *, fire_callback):
         return await create_or_reuse_grant(req, requestor_name)
 
     @app.get("/api/grants/active")
-    async def list_active_grants(resourceType: Optional[str] = None):
+    async def list_active_grants(
+        request: Request,
+        resourceType: Optional[str] = None,
+    ):
         now = datetime.now(timezone.utc).isoformat()
+        requestor_name = getattr(request.state, "requestor_name", None) or CONFIG.get(
+            "agent_name", "Agent"
+        )
         conn = db_conn()
         try:
             if resourceType:
                 rows = conn.execute(
                     "SELECT * FROM grants WHERE status='active' "
-                    "AND resource_type=? AND (expires_at IS NULL OR expires_at>?)",
-                    (resourceType, now),
+                    "AND resource_type=? AND requestor=? "
+                    "AND (expires_at IS NULL OR expires_at>?)",
+                    (resourceType, requestor_name, now),
                 ).fetchall()
             else:
                 rows = conn.execute(
                     "SELECT * FROM grants WHERE status='active' "
-                    "AND (expires_at IS NULL OR expires_at>?)",
-                    (now,),
+                    "AND requestor=? AND (expires_at IS NULL OR expires_at>?)",
+                    (requestor_name, now),
                 ).fetchall()
         finally:
             conn.close()
         return {"grants": [sanitize_grant(dict(r)) for r in rows]}
 
     @app.get("/api/grants/{grant_id}")
-    async def get_grant(grant_id: str):
+    async def get_grant(grant_id: str, request: Request):
+        requestor_name = getattr(request.state, "requestor_name", None) or CONFIG.get(
+            "agent_name", "Agent"
+        )
         conn = db_conn()
         try:
-            row = conn.execute("SELECT * FROM grants WHERE id=?", (grant_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM grants WHERE id=? AND requestor=?",
+                (grant_id, requestor_name),
+            ).fetchone()
         finally:
             conn.close()
         if not row:
@@ -349,15 +362,28 @@ def register(app: FastAPI, *, fire_callback):
         return sanitize_grant(dict(row))
 
     @app.delete("/api/grants/{grant_id}")
-    async def revoke_grant(grant_id: str):
+    async def revoke_grant(grant_id: str, request: Request):
+        requestor_name = getattr(request.state, "requestor_name", None) or CONFIG.get(
+            "agent_name", "Agent"
+        )
         conn = db_conn()
         try:
-            row = conn.execute("SELECT * FROM grants WHERE id=?", (grant_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM grants WHERE id=? AND requestor=?",
+                (grant_id, requestor_name),
+            ).fetchone()
             if not row:
                 raise HTTPException(404, "Grant not found")
-            conn.execute("UPDATE grants SET status='revoked' WHERE id=?", (grant_id,))
+            conn.execute(
+                "UPDATE grants SET status='revoked' WHERE id=? AND requestor=?",
+                (grant_id, requestor_name),
+            )
             conn.commit()
         finally:
             conn.close()
-        audit({"action": "grant_revoked", "grantId": grant_id})
+        audit({
+            "action": "grant_revoked",
+            "grantId": grant_id,
+            "requestor": requestor_name,
+        })
         return {"grantId": grant_id, "status": "revoked"}
