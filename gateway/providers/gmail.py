@@ -3,14 +3,17 @@
 import asyncio
 import base64
 import binascii
+import copy
 import json
 import logging
+import threading
 from datetime import datetime, timezone
 from email.utils import parseaddr
 from fnmatch import fnmatch
 from html import escape
 from typing import Optional
 
+import requests
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 
 from gateway.audit import audit
@@ -22,49 +25,63 @@ log = logging.getLogger("gateway.providers.gmail")
 
 # ── Gmail OAuth client ────────────────────────────────────────────────────
 
-_gmail_service = None
 _credentials = None
+_credentials_lock = threading.Lock()
 
 
 def get_gmail_service():
-    """Get or refresh the authenticated Gmail API service."""
+    """Build an isolated client; the caller owns and must close it.
+
+    httplib2 transports are not thread-safe. Cache credentials, never the
+    service/transport. A credential snapshot also isolates automatic refresh
+    during execute() from other operations.
+    """
     from google.auth.transport.requests import Request as GoogleAuthRequest
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
 
-    global _gmail_service, _credentials
+    global _credentials
 
-    if _credentials is not None and _credentials.valid:
-        return _gmail_service
+    with _credentials_lock:
+        if _credentials is None:
+            vault_secrets = vault.read_all()
+            _credentials = Credentials(
+                # Vault stores no expiry for the access token. Refresh once on
+                # startup rather than cloning a stale token into every client.
+                token=None,
+                refresh_token=vault_secrets["refresh_token"],
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id=vault_secrets["client_id"],
+                client_secret=vault_secrets["client_secret"],
+                scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+            )
 
-    if _credentials is not None and _credentials.expired and _credentials.refresh_token:
-        _credentials.refresh(GoogleAuthRequest())
-        try:
-            vault.patch({"access_token": _credentials.token})
-        except Exception as e:
-            log.warning("Failed to persist refreshed access token to vault: %s", e)
-        _gmail_service = build("gmail", "v1", credentials=_credentials, cache_discovery=False)
-        return _gmail_service
+        if not _credentials.valid:
+            # Explicitly close the requests session used only for OAuth refresh.
+            with requests.Session() as session:
+                _credentials.refresh(GoogleAuthRequest(session=session))
+            try:
+                vault.patch({"access_token": _credentials.token})
+            except Exception as e:
+                log.warning("Failed to persist refreshed access token to vault: %s", e)
 
-    vault_secrets = vault.read_all()
-    _credentials = Credentials(
-        token=vault_secrets.get("access_token"),
-        refresh_token=vault_secrets["refresh_token"],
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=vault_secrets["client_id"],
-        client_secret=vault_secrets["client_secret"],
-        scopes=["https://www.googleapis.com/auth/gmail.readonly"],
-    )
+        credentials = copy.copy(_credentials)
 
-    if not _credentials.valid:
-        _credentials.refresh(GoogleAuthRequest())
-        try:
-            vault.patch({"access_token": _credentials.token})
-        except Exception as e:
-            log.warning("Failed to persist access token to vault: %s", e)
+    return build("gmail", "v1", credentials=credentials, cache_discovery=False)
 
-    _gmail_service = build("gmail", "v1", credentials=_credentials, cache_discovery=False)
-    return _gmail_service
+
+def execute_gmail(operation):
+    """Create, use and close one client inside a single worker invocation.
+
+    Batch construction and execution belong in the same operation too. Do not
+    return a live request or service from operation; return its decoded result.
+    Cancellation of the awaiting task leaves this worker owning its cleanup.
+    """
+    service = get_gmail_service()
+    try:
+        return operation(service)
+    finally:
+        service.close()
 
 
 # ── Email helpers ─────────────────────────────────────────────────────────
@@ -211,10 +228,11 @@ def get_active_grant_for_message(
 def _message_matches_query(message_id: str, query: str) -> bool:
     """Check whether message_id appears in the results of a Gmail query."""
     try:
-        service = get_gmail_service()
-        results = service.users().messages().list(
-            userId="me", q=query, maxResults=500
-        ).execute()
+        results = execute_gmail(
+            lambda service: service.users().messages().list(
+                userId="me", q=query, maxResults=500
+            ).execute()
+        )
         return message_id in {m["id"] for m in results.get("messages", [])}
     except Exception as e:
         log.error("Query match check failed: %s", e)
@@ -333,9 +351,8 @@ def _register_gmail_routes(app: FastAPI):
     @app.get("/api/profile")
     async def get_profile():
         """Get the connected Gmail account profile."""
-        service = await asyncio.to_thread(get_gmail_service)
         profile = await asyncio.to_thread(
-            lambda: service.users().getProfile(userId="me").execute()
+            execute_gmail, lambda service: service.users().getProfile(userId="me").execute()
         )
         audit({"action": "profile_read"})
         return {
@@ -348,44 +365,44 @@ def _register_gmail_routes(app: FastAPI):
     @app.get("/api/labels")
     async def list_labels():
         """List all Gmail labels with message/thread counts."""
-        service = await asyncio.to_thread(get_gmail_service)
-        result = await asyncio.to_thread(
-            lambda: service.users().labels().list(userId="me").execute()
-        )
+        def fetch_labels(service):
+            result = service.users().labels().list(userId="me").execute()
 
-        labels_raw = result.get("labels", [])
-        batch = service.new_batch_http_request()
-        labels: list[dict] = []
+            labels_raw = result.get("labels", [])
+            batch = service.new_batch_http_request()
+            labels: list[dict] = []
 
-        def _cb(request_id, response, exception):
-            if exception is None:
-                labels.append({
-                    "id": response["id"],
-                    "name": response["name"],
-                    "type": response.get("type", "user"),
-                    "messagesTotal": response.get("messagesTotal", 0),
-                    "messagesUnread": response.get("messagesUnread", 0),
-                    "threadsTotal": response.get("threadsTotal", 0),
-                    "threadsUnread": response.get("threadsUnread", 0),
-                })
+            def _cb(request_id, response, exception):
+                if exception is None:
+                    labels.append({
+                        "id": response["id"],
+                        "name": response["name"],
+                        "type": response.get("type", "user"),
+                        "messagesTotal": response.get("messagesTotal", 0),
+                        "messagesUnread": response.get("messagesUnread", 0),
+                        "threadsTotal": response.get("threadsTotal", 0),
+                        "threadsUnread": response.get("threadsUnread", 0),
+                    })
 
-        for lbl in labels_raw:
-            batch.add(
-                service.users().labels().get(userId="me", id=lbl["id"]),
-                callback=_cb,
-            )
+            for lbl in labels_raw:
+                batch.add(
+                    service.users().labels().get(userId="me", id=lbl["id"]),
+                    callback=_cb,
+                )
 
-        await asyncio.to_thread(batch.execute)
+            batch.execute()
+            return labels
+
+        labels = await asyncio.to_thread(execute_gmail, fetch_labels)
         audit({"action": "labels_list", "count": len(labels)})
         return {"labels": labels}
 
     @app.get("/api/labels/{label_id}")
     async def get_label(label_id: str):
         """Get details for a single label."""
-        service = await asyncio.to_thread(get_gmail_service)
         try:
             lbl = await asyncio.to_thread(
-                lambda: service.users().labels().get(userId="me", id=label_id).execute()
+                execute_gmail, lambda service: service.users().labels().get(userId="me", id=label_id).execute()
             )
         except Exception:
             raise HTTPException(404, "Label not found")
@@ -408,7 +425,6 @@ def _register_gmail_routes(app: FastAPI):
         pageToken: Optional[str] = None,
     ):
         """List/search emails — Level 0, metadata only."""
-        service = await asyncio.to_thread(get_gmail_service)
 
         kwargs: dict = {"userId": "me", "maxResults": maxResults}
         if q:
@@ -418,34 +434,37 @@ def _register_gmail_routes(app: FastAPI):
         if pageToken:
             kwargs["pageToken"] = pageToken
 
-        results = await asyncio.to_thread(
-            lambda: service.users().messages().list(**kwargs).execute()
-        )
+        def fetch_messages(service):
+            results = service.users().messages().list(**kwargs).execute()
 
-        messages = []
-        if "messages" in results:
-            batch = service.new_batch_http_request()
-            fetched: list[dict] = []
+            messages = []
+            if "messages" in results:
+                batch = service.new_batch_http_request()
+                fetched: list[dict] = []
 
-            def _cb(request_id, response, exception):
-                if exception is None:
-                    fetched.append(extract_metadata(response))
-                else:
-                    log.warning("Batch fetch error for %s: %s", request_id, exception)
+                def _cb(request_id, response, exception):
+                    if exception is None:
+                        fetched.append(extract_metadata(response))
+                    else:
+                        log.warning("Batch fetch error for %s: %s", request_id, exception)
 
-            for msg_ref in results["messages"]:
-                batch.add(
-                    service.users().messages().get(
-                        userId="me",
-                        id=msg_ref["id"],
-                        format="metadata",
-                        metadataHeaders=["From", "To", "Subject", "Date"],
-                    ),
-                    callback=_cb,
-                )
+                for msg_ref in results["messages"]:
+                    batch.add(
+                        service.users().messages().get(
+                            userId="me",
+                            id=msg_ref["id"],
+                            format="metadata",
+                            metadataHeaders=["From", "To", "Subject", "Date"],
+                        ),
+                        callback=_cb,
+                    )
 
-            await asyncio.to_thread(batch.execute)
-            messages = fetched
+                batch.execute()
+                messages = fetched
+
+            return results, messages
+
+        results, messages = await asyncio.to_thread(execute_gmail, fetch_messages)
 
         audit({
             "action": "metadata_search",
@@ -467,9 +486,8 @@ def _register_gmail_routes(app: FastAPI):
         override_sensitive: bool = False,
     ):
         """Get email by ID. Metadata always; full body only with an active grant."""
-        service = await asyncio.to_thread(get_gmail_service)
         msg = await asyncio.to_thread(
-            lambda: service.users().messages().get(
+            execute_gmail, lambda service: service.users().messages().get(
                 userId="me", id=message_id, format="full"
             ).execute()
         )
@@ -569,9 +587,8 @@ def _register_gmail_routes(app: FastAPI):
                 "No active grant covers this message. POST /api/grants/request first.",
             )
 
-        service = await asyncio.to_thread(get_gmail_service)
         metadata_msg = await asyncio.to_thread(
-            lambda: service.users().messages().get(
+            execute_gmail, lambda service: service.users().messages().get(
                 userId="me",
                 id=message_id,
                 format="metadata",
@@ -596,7 +613,7 @@ def _register_gmail_routes(app: FastAPI):
             )
 
         raw_msg = await asyncio.to_thread(
-            lambda: service.users().messages().get(
+            execute_gmail, lambda service: service.users().messages().get(
                 userId="me", id=message_id, format="raw"
             ).execute()
         )
@@ -649,9 +666,8 @@ def _register_gmail_routes(app: FastAPI):
     @app.get("/api/emails/{message_id}/attachments")
     async def list_attachments(message_id: str):
         """List attachment metadata for a message (Level 0, no content)."""
-        service = await asyncio.to_thread(get_gmail_service)
         msg = await asyncio.to_thread(
-            lambda: service.users().messages().get(
+            execute_gmail, lambda service: service.users().messages().get(
                 userId="me", id=message_id, format="full"
             ).execute()
         )
@@ -681,9 +697,8 @@ def _register_gmail_routes(app: FastAPI):
                 "No active grant covers this message. POST /api/grants/request first.",
             )
 
-        service = await asyncio.to_thread(get_gmail_service)
         msg = await asyncio.to_thread(
-            lambda: service.users().messages().get(
+            execute_gmail, lambda service: service.users().messages().get(
                 userId="me", id=message_id, format="metadata",
                 metadataHeaders=["From", "Subject"],
             ).execute()
@@ -699,14 +714,14 @@ def _register_gmail_routes(app: FastAPI):
             )
 
         att = await asyncio.to_thread(
-            lambda: service.users().messages().attachments().get(
+            execute_gmail, lambda service: service.users().messages().attachments().get(
                 userId="me", messageId=message_id, id=attachment_id
             ).execute()
         )
         data = base64.urlsafe_b64decode(att["data"])
 
         full_msg = await asyncio.to_thread(
-            lambda: service.users().messages().get(
+            execute_gmail, lambda service: service.users().messages().get(
                 userId="me", id=message_id, format="full"
             ).execute()
         )
@@ -746,7 +761,6 @@ def _register_gmail_routes(app: FastAPI):
         pageToken: Optional[str] = None,
     ):
         """List/search threads — Level 0, metadata only."""
-        service = await asyncio.to_thread(get_gmail_service)
 
         kwargs: dict = {"userId": "me", "maxResults": maxResults}
         if q:
@@ -757,7 +771,7 @@ def _register_gmail_routes(app: FastAPI):
             kwargs["pageToken"] = pageToken
 
         results = await asyncio.to_thread(
-            lambda: service.users().threads().list(**kwargs).execute()
+            execute_gmail, lambda service: service.users().threads().list(**kwargs).execute()
         )
 
         threads = []
@@ -786,9 +800,8 @@ def _register_gmail_routes(app: FastAPI):
         override_sensitive: bool = False,
     ):
         """Get all messages in a thread."""
-        service = await asyncio.to_thread(get_gmail_service)
         thread = await asyncio.to_thread(
-            lambda: service.users().threads().get(
+            execute_gmail, lambda service: service.users().threads().get(
                 userId="me", id=thread_id, format="full"
             ).execute()
         )
@@ -881,7 +894,6 @@ def _register_gmail_routes(app: FastAPI):
             )
         grant = dict(grant)
 
-        service = await asyncio.to_thread(get_gmail_service)
         kwargs: dict = {
             "userId": "me",
             "startHistoryId": startHistoryId,
@@ -896,7 +908,7 @@ def _register_gmail_routes(app: FastAPI):
 
         try:
             result = await asyncio.to_thread(
-                lambda: service.users().history().list(**kwargs).execute()
+                execute_gmail, lambda service: service.users().history().list(**kwargs).execute()
             )
         except Exception as e:
             error_str = str(e)

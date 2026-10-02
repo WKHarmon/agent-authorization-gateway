@@ -200,10 +200,9 @@ async def create_or_reuse_grant(
     # Gmail-specific: fetch message metadata for L1 notifications
     if req.resourceType == "gmail" and req.messageId:
         try:
-            from gateway.providers.gmail import extract_metadata, get_gmail_service
-            service = await asyncio.to_thread(get_gmail_service)
+            from gateway.providers.gmail import extract_metadata, execute_gmail
             msg = await asyncio.to_thread(
-                lambda: service.users().messages().get(
+                execute_gmail, lambda service: service.users().messages().get(
                     userId="me",
                     id=req.messageId,
                     format="metadata",

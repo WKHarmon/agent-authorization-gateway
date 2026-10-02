@@ -80,6 +80,9 @@ class FakeGmailService:
     def users(self):
         return self._users
 
+    def close(self):
+        pass
+
 
 @pytest.fixture
 def gmail_env(gateway_env, monkeypatch):
